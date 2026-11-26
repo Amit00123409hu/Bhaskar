@@ -1858,8 +1858,8 @@
 
     <script type="module">
       import * as THREE from "three";
-      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-      import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+      import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+      import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 
       (function () {
         // ============================================================
@@ -2446,10 +2446,11 @@
         }
 
         // ============================================================
-        // 5. THREE.JS 3D ROAD SCENE ENGINE
+        // 5. THREE.JS 3D ROAD SCENE ENGINE (WITH RESILIENT FALLBACK)
         // ============================================================
         const STOP_LINE_X = 4.0;
         const ROAD_HALF_LEN = 75;
+        const KMH_TO_UNITS = 0.16;
         const CAMERA_PRESETS = [
           {
             name: "Perspective",
@@ -2485,78 +2486,109 @@
         const _hemiDayGround = new THREE.Color(0x3f6212);
         const _hemiNightGround = new THREE.Color(0x0f172a);
 
-        // Software WebGL guard
-        const isSoftwareGl = (() => {
-          try {
-            const gl = document.createElement("canvas").getContext("webgl2");
-            if (!gl) return true;
-            const ext = gl.getExtension("WEBGL_debug_renderer_info");
-            const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
-            const gpu = String(gl.getParameter(param) || "");
-            gl.getExtension("WEBGL_lose_context")?.loseContext();
-            return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
-          } catch (_) {
-            return false;
+        // Create WebGLRenderer safely without spawning extra throwaway contexts
+        function createSafeRenderer() {
+          const attempts = [
+            { antialias: true, powerPreference: "default" },
+            { antialias: false, failIfMajorPerformanceCaveat: false },
+          ];
+          for (let a = 0; a < attempts.length; a++) {
+            try {
+              return new THREE.WebGLRenderer(attempts[a]);
+            } catch (_) {}
           }
-        })();
+          return null;
+        }
 
-        const threeScene = new THREE.Scene();
-        threeScene.background = _skyDay.clone();
-        threeScene.fog = new THREE.Fog(_skyDay.getHex(), 38, 105);
+        let threeRenderer = null;
+        let threeScene = null;
+        let threeCamera = null;
+        let orbitControls = null;
+        let isSoftwareGl = false;
+        let is2DFallback = false;
+        let fallbackCtx = null;
+        let fallbackCanvas = null;
 
-        const threeCamera = new THREE.PerspectiveCamera(45, 16 / 9, 0.1, 200);
-        threeCamera.position.copy(CAMERA_PRESETS[0].pos);
+        threeRenderer = createSafeRenderer();
+        if (threeRenderer) {
+          try {
+            const gl = threeRenderer.getContext();
+            if (gl) {
+              const ext = gl.getExtension("WEBGL_debug_renderer_info");
+              const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+              const gpu = String(gl.getParameter(param) || "");
+              isSoftwareGl = /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+            }
+          } catch (_) {
+            isSoftwareGl = false;
+          }
 
-        const threeRenderer = new THREE.WebGLRenderer({
-          antialias: !isSoftwareGl,
-          powerPreference: "high-performance",
-        });
-        threeRenderer.outputColorSpace = THREE.SRGBColorSpace;
-        threeRenderer.toneMapping = THREE.ACESFilmicToneMapping;
-        threeRenderer.toneMappingExposure = 1.1;
-        threeRenderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
-        threeRenderer.shadowMap.enabled = !isSoftwareGl;
-        threeRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
-        threeMount.appendChild(threeRenderer.domElement);
+          threeScene = new THREE.Scene();
+          threeScene.background = _skyDay.clone();
+          threeScene.fog = new THREE.Fog(_skyDay.getHex(), 38, 105);
 
-        // Mandatory Studio Environment Reflections (RoomEnvironment)
-        const pmremGenerator = new THREE.PMREMGenerator(threeRenderer);
-        threeScene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-        pmremGenerator.dispose();
+          threeCamera = new THREE.PerspectiveCamera(45, 16 / 9, 0.1, 200);
+          threeCamera.position.copy(CAMERA_PRESETS[0].pos);
+          threeCamera.lookAt(CAMERA_PRESETS[0].target);
+          threeCamera.updateMatrixWorld();
 
-        const orbitControls = new OrbitControls(threeCamera, threeRenderer.domElement);
-        orbitControls.target.copy(CAMERA_PRESETS[0].target);
-        orbitControls.enableDamping = !isSoftwareGl;
-        orbitControls.dampingFactor = 0.07;
-        orbitControls.maxPolarAngle = Math.PI / 2 - 0.04;
-        orbitControls.minDistance = 7;
-        orbitControls.maxDistance = 42;
-        orbitControls.addEventListener("start", () => {
-          isCameraDamping = false;
-        });
+          threeRenderer.outputColorSpace = THREE.SRGBColorSpace;
+          threeRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+          threeRenderer.toneMappingExposure = 1.1;
+          threeRenderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+          threeRenderer.shadowMap.enabled = !isSoftwareGl;
+          threeRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+          threeMount.appendChild(threeRenderer.domElement);
 
-        // Warm Key + Cool Hemisphere + Subtle Rim Light
-        const hemiLight = new THREE.HemisphereLight(_hemiDaySky.getHex(), _hemiDayGround.getHex(), 0.72);
-        threeScene.add(hemiLight);
+          // Studio Environment Reflections (safe fallback if PMREM unavailable)
+          try {
+            const pmremGenerator = new THREE.PMREMGenerator(threeRenderer);
+            threeScene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+            pmremGenerator.dispose();
+          } catch (_) {}
 
-        const sunLight = new THREE.DirectionalLight(0xfff4d6, 1.55);
-        sunLight.position.set(-18, 28, 16);
-        sunLight.castShadow = !isSoftwareGl;
-        sunLight.shadow.mapSize.width = 1024;
-        sunLight.shadow.mapSize.height = 1024;
-        sunLight.shadow.camera.near = 2;
-        sunLight.shadow.camera.far = 80;
-        sunLight.shadow.camera.left = -26;
-        sunLight.shadow.camera.right = 26;
-        sunLight.shadow.camera.top = 18;
-        sunLight.shadow.camera.bottom = -18;
-        sunLight.shadow.bias = -0.0005;
-        sunLight.shadow.normalBias = 0.02;
-        threeScene.add(sunLight);
+          orbitControls = new OrbitControls(threeCamera, threeRenderer.domElement);
+          orbitControls.target.copy(CAMERA_PRESETS[0].target);
+          orbitControls.enableDamping = !isSoftwareGl;
+          orbitControls.dampingFactor = 0.07;
+          orbitControls.maxPolarAngle = Math.PI / 2 - 0.04;
+          orbitControls.minDistance = 7;
+          orbitControls.maxDistance = 42;
+          orbitControls.update();
+          orbitControls.addEventListener("start", () => {
+            isCameraDamping = false;
+          });
+        } else {
+          is2DFallback = true;
+        }
 
-        const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.45);
-        rimLight.position.set(18, 12, -18);
-        threeScene.add(rimLight);
+        // Warm Key + Cool Hemisphere + Subtle Rim Light (3D mode)
+        const hemiLight = threeScene
+          ? new THREE.HemisphereLight(_hemiDaySky.getHex(), _hemiDayGround.getHex(), 0.72)
+          : null;
+        const sunLight = threeScene ? new THREE.DirectionalLight(0xfff4d6, 1.55) : null;
+        const rimLight = threeScene ? new THREE.DirectionalLight(0x93c5fd, 0.45) : null;
+        if (threeScene) {
+          threeScene.add(hemiLight);
+          sunLight.position.set(-18, 28, 16);
+          sunLight.castShadow = !isSoftwareGl;
+          sunLight.shadow.mapSize.width = 1024;
+          sunLight.shadow.mapSize.height = 1024;
+          sunLight.shadow.camera.near = 2;
+          sunLight.shadow.camera.far = 80;
+          sunLight.shadow.camera.left = -26;
+          sunLight.shadow.camera.right = 26;
+          sunLight.shadow.camera.top = 18;
+          sunLight.shadow.camera.bottom = -18;
+          sunLight.shadow.bias = -0.0005;
+          sunLight.shadow.normalBias = 0.02;
+          threeScene.add(sunLight);
+        }
+
+        if (threeScene && rimLight) {
+          rimLight.position.set(18, 12, -18);
+          threeScene.add(rimLight);
+        }
 
         // Procedural Road Canvas Texture
         function createRoadTexture() {
@@ -2592,7 +2624,7 @@
           tex.wrapS = THREE.RepeatWrapping;
           tex.wrapT = THREE.ClampToEdgeWrapping;
           tex.repeat.set(7, 1);
-          tex.anisotropy = threeRenderer.capabilities.getMaxAnisotropy();
+          if (threeRenderer) tex.anisotropy = threeRenderer.capabilities.getMaxAnisotropy();
           return tex;
         }
 
@@ -2618,52 +2650,52 @@
           roughness: 0.94,
           metalness: 0.0,
         });
-        const groundMesh = new THREE.Mesh(new THREE.PlaneGeometry(220, 220), meadowMat);
-        groundMesh.rotation.x = -Math.PI / 2;
-        groundMesh.position.y = -0.04;
-        groundMesh.receiveShadow = true;
-        threeScene.add(groundMesh);
+        const groundMesh = threeScene ? new THREE.Mesh(new THREE.PlaneGeometry(220, 220), meadowMat) : null;
+        if (threeScene) {
+          groundMesh.rotation.x = -Math.PI / 2;
+          groundMesh.position.y = -0.04;
+          groundMesh.receiveShadow = true;
+          threeScene.add(groundMesh);
 
-        const roadTex = createRoadTexture();
-        const roadMat = new THREE.MeshStandardMaterial({
-          map: roadTex,
-          roughness: 0.82,
-          metalness: 0.05,
-        });
-        const roadMesh = new THREE.Mesh(new THREE.PlaneGeometry(ROAD_HALF_LEN * 2, 10.0), roadMat);
-        roadMesh.rotation.x = -Math.PI / 2;
-        roadMesh.position.y = 0.0;
-        roadMesh.receiveShadow = true;
-        threeScene.add(roadMesh);
+          const roadTex = createRoadTexture();
+          const roadMat = new THREE.MeshStandardMaterial({
+            map: roadTex,
+            roughness: 0.82,
+            metalness: 0.05,
+          });
+          const roadMesh = new THREE.Mesh(new THREE.PlaneGeometry(ROAD_HALF_LEN * 2, 10.0), roadMat);
+          roadMesh.rotation.x = -Math.PI / 2;
+          roadMesh.position.y = 0.0;
+          roadMesh.receiveShadow = true;
+          threeScene.add(roadMesh);
 
-        // Curbs & Sidewalks
-        const curbMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.85, metalness: 0.05 });
-        [-5.6, 5.6].forEach((cz) => {
-          const curb = new THREE.Mesh(new THREE.BoxGeometry(ROAD_HALF_LEN * 2, 0.16, 1.3), curbMat);
-          curb.position.set(0, 0.08, cz);
-          curb.receiveShadow = true;
-          threeScene.add(curb);
-        });
+          const curbMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, roughness: 0.85, metalness: 0.05 });
+          [-5.6, 5.6].forEach((cz) => {
+            const curb = new THREE.Mesh(new THREE.BoxGeometry(ROAD_HALF_LEN * 2, 0.16, 1.3), curbMat);
+            curb.position.set(0, 0.08, cz);
+            curb.receiveShadow = true;
+            threeScene.add(curb);
+          });
 
-        // White Stop Line & Zebra Crossing (offset >= 0.02 above road, polygonOffset)
-        const roadMarkingMat = new THREE.MeshStandardMaterial({
-          color: 0xf8fafc,
-          roughness: 0.6,
-          metalness: 0.02,
-          polygonOffset: true,
-          polygonOffsetFactor: -1,
-          polygonOffsetUnits: -1,
-        });
-        const stopLineMesh = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.02, 9.2), roadMarkingMat);
-        stopLineMesh.position.set(STOP_LINE_X, 0.02, 0);
-        stopLineMesh.receiveShadow = true;
-        threeScene.add(stopLineMesh);
+          const roadMarkingMat = new THREE.MeshStandardMaterial({
+            color: 0xf8fafc,
+            roughness: 0.6,
+            metalness: 0.02,
+            polygonOffset: true,
+            polygonOffsetFactor: -1,
+            polygonOffsetUnits: -1,
+          });
+          const stopLineMesh = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.02, 9.2), roadMarkingMat);
+          stopLineMesh.position.set(STOP_LINE_X, 0.02, 0);
+          stopLineMesh.receiveShadow = true;
+          threeScene.add(stopLineMesh);
 
-        for (let i = 0; i < 6; i++) {
-          const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.02, 0.85), roadMarkingMat);
-          stripe.position.set(STOP_LINE_X + 2.2, 0.02, -3.75 + i * 1.5);
-          stripe.receiveShadow = true;
-          threeScene.add(stripe);
+          for (let i = 0; i < 6; i++) {
+            const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.02, 0.85), roadMarkingMat);
+            stripe.position.set(STOP_LINE_X + 2.2, 0.02, -3.75 + i * 1.5);
+            stripe.receiveShadow = true;
+            threeScene.add(stripe);
+          }
         }
 
         // Priority Lane Label ("VIP / AMBULANCE" subtle road strip)
@@ -2680,22 +2712,24 @@
           ctx.fillText(text, 256, 64);
           const tex = new THREE.CanvasTexture(c);
           tex.colorSpace = THREE.SRGBColorSpace;
-          tex.anisotropy = threeRenderer.capabilities.getMaxAnisotropy();
+          if (threeRenderer) tex.anisotropy = threeRenderer.capabilities.getMaxAnisotropy();
           return tex;
         }
-        const prioritySignPlane = new THREE.Mesh(
-          new THREE.PlaneGeometry(7.2, 1.8),
-          new THREE.MeshBasicMaterial({
-            map: createLaneBadgeTexture("VIP / AMBULANCE"),
-            transparent: true,
-            depthWrite: false,
-            polygonOffset: true,
-            polygonOffsetFactor: -1,
-          })
-        );
-        prioritySignPlane.rotation.x = -Math.PI / 2;
-        prioritySignPlane.position.set(-4.5, 0.025, -2.35);
-        threeScene.add(prioritySignPlane);
+        if (threeScene) {
+          const prioritySignPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(7.2, 1.8),
+            new THREE.MeshBasicMaterial({
+              map: createLaneBadgeTexture("VIP / AMBULANCE"),
+              transparent: true,
+              depthWrite: false,
+              polygonOffset: true,
+              polygonOffsetFactor: -1,
+            })
+          );
+          prioritySignPlane.rotation.x = -Math.PI / 2;
+          prioritySignPlane.position.set(-4.5, 0.025, -2.35);
+          threeScene.add(prioritySignPlane);
+        }
 
         // Perimeter Trees (InstancedMesh trunks + 2-tier crowns)
         const treeCoords = [];
@@ -2748,62 +2782,65 @@
           tintColor.offsetHSL(0, 0, 0.04);
           topCrownInst.setColorAt(idx, tintColor);
         });
-        trunkInst.instanceMatrix.needsUpdate = true;
-        crownInst.instanceMatrix.needsUpdate = true;
-        topCrownInst.instanceMatrix.needsUpdate = true;
-        if (crownInst.instanceColor) crownInst.instanceColor.needsUpdate = true;
-        if (topCrownInst.instanceColor) topCrownInst.instanceColor.needsUpdate = true;
-        trunkInst.computeBoundingSphere();
-        crownInst.computeBoundingSphere();
-        topCrownInst.computeBoundingSphere();
-        threeScene.add(trunkInst, crownInst, topCrownInst);
+        if (threeScene) {
+          trunkInst.instanceMatrix.needsUpdate = true;
+          crownInst.instanceMatrix.needsUpdate = true;
+          topCrownInst.instanceMatrix.needsUpdate = true;
+          if (crownInst.instanceColor) crownInst.instanceColor.needsUpdate = true;
+          if (topCrownInst.instanceColor) topCrownInst.instanceColor.needsUpdate = true;
+          trunkInst.computeBoundingSphere();
+          crownInst.computeBoundingSphere();
+          topCrownInst.computeBoundingSphere();
+          threeScene.add(trunkInst, crownInst, topCrownInst);
+        }
 
         // Streetlamps (turn on warm glow in Night Mode)
         const streetLampGlowMats = [];
         const streetLampLights = [];
         const steelMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.75, roughness: 0.35 });
-        [-28, -10, 14, 32].forEach((lx) => {
-          const group = new THREE.Group();
-          group.position.set(lx, 0, -5.8);
-          const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 5.4, 10), steelMat);
-          pole.position.y = 2.7;
-          const arm = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 1.3), steelMat);
-          arm.position.set(0, 5.35, 0.55);
-          const bulbMat = new THREE.MeshStandardMaterial({
-            color: 0xfef08a,
-            emissive: 0xfbbf24,
-            emissiveIntensity: 0.0,
-            roughness: 0.2,
+        if (threeScene) {
+          [-28, -10, 14, 32].forEach((lx) => {
+            const group = new THREE.Group();
+            group.position.set(lx, 0, -5.8);
+            const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 5.4, 10), steelMat);
+            pole.position.y = 2.7;
+            const arm = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 1.3), steelMat);
+            arm.position.set(0, 5.35, 0.55);
+            const bulbMat = new THREE.MeshStandardMaterial({
+              color: 0xfef08a,
+              emissive: 0xfbbf24,
+              emissiveIntensity: 0.0,
+              roughness: 0.2,
+            });
+            streetLampGlowMats.push(bulbMat);
+            const bulb = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.12, 0.56), bulbMat);
+            bulb.position.set(0, 5.25, 1.05);
+            group.add(pole, arm, bulb);
+
+            if (lx === -10 || lx === 14) {
+              const pLight = new THREE.PointLight(0xfde68a, 0, 18, 1.6);
+              pLight.position.set(0, 5.0, 1.1);
+              group.add(pLight);
+              streetLampLights.push(pLight);
+            }
+            threeScene.add(group);
           });
-          streetLampGlowMats.push(bulbMat);
-          const bulb = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.12, 0.56), bulbMat);
-          bulb.position.set(0, 5.25, 1.05);
-          group.add(pole, arm, bulb);
 
-          if (lx === -10 || lx === 14) {
-            const pLight = new THREE.PointLight(0xfde68a, 0, 18, 1.6);
-            pLight.position.set(0, 5.0, 1.1);
-            group.add(pLight);
-            streetLampLights.push(pLight);
+          const bldgColors = [0xcbd5e1, 0x94a3b8, 0xe2e8f0, 0xbfdbfe];
+          for (let bx = -44; bx <= 44; bx += 14) {
+            const bh = 4.2 + ((Math.abs(bx) * 3) % 5);
+            const bldg = new THREE.Mesh(
+              new THREE.BoxGeometry(7.5, bh, 5.5),
+              new THREE.MeshStandardMaterial({
+                color: bldgColors[Math.abs(bx) % bldgColors.length],
+                roughness: 0.85,
+                metalness: 0.08,
+              })
+            );
+            bldg.position.set(bx, bh / 2 - 0.04, -22.5);
+            bldg.receiveShadow = true;
+            threeScene.add(bldg);
           }
-          threeScene.add(group);
-        });
-
-        // Low-rise City Backdrop Blocks (distant right/back horizon accent, open horizon)
-        const bldgColors = [0xcbd5e1, 0x94a3b8, 0xe2e8f0, 0xbfdbfe];
-        for (let bx = -44; bx <= 44; bx += 14) {
-          const bh = 4.2 + ((Math.abs(bx) * 3) % 5);
-          const bldg = new THREE.Mesh(
-            new THREE.BoxGeometry(7.5, bh, 5.5),
-            new THREE.MeshStandardMaterial({
-              color: bldgColors[Math.abs(bx) % bldgColors.length],
-              roughness: 0.85,
-              metalness: 0.08,
-            })
-          );
-          bldg.position.set(bx, bh / 2 - 0.04, -22.5);
-          bldg.receiveShadow = true;
-          threeScene.add(bldg);
         }
 
         // 3D Traffic Signal Gantry (grounded at x = 4.6, z = 5.6)
@@ -2823,7 +2860,6 @@
         crossArm.position.set(0, 5.35, -3.0);
         crossArm.castShadow = !isSoftwareGl;
 
-        // Overhead signal housing facing -X (approaching traffic)
         const housingMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.45, metalness: 0.55 });
         const signalBox = new THREE.Mesh(new THREE.BoxGeometry(0.68, 2.35, 0.82), housingMat);
         signalBox.position.set(0, 4.6, -2.9);
@@ -2871,50 +2907,51 @@
         signalPointLight.position.set(-1.1, 4.4, -2.9);
 
         signalGroup.add(basePlinth, mainMast, crossArm, signalBox, poleBox, signalPointLight);
-        threeScene.add(signalGroup);
+        if (threeScene) {
+          threeScene.add(signalGroup);
 
-        // Highway 80 km/h Speed Limit Roadside Sign (x = -5.5, z = 5.45)
-        const speedSignGroup = new THREE.Group();
-        speedSignGroup.position.set(-5.5, 0, 5.45);
-        const signPole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 3.0, 10), steelMat);
-        signPole.position.y = 1.5;
-        signPole.castShadow = !isSoftwareGl;
+          const speedSignGroup = new THREE.Group();
+          speedSignGroup.position.set(-5.5, 0, 5.45);
+          const signPole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 3.0, 10), steelMat);
+          signPole.position.y = 1.5;
+          signPole.castShadow = !isSoftwareGl;
 
-        const signCanvas = document.createElement("canvas");
-        signCanvas.width = 256;
-        signCanvas.height = 256;
-        const sctx = signCanvas.getContext("2d");
-        sctx.fillStyle = "#ffffff";
-        sctx.fillRect(0, 0, 256, 256);
-        sctx.strokeStyle = "#dc2626";
-        sctx.lineWidth = 28;
-        sctx.beginPath();
-        sctx.arc(128, 128, 106, 0, Math.PI * 2);
-        sctx.stroke();
-        sctx.fillStyle = "#0f172a";
-        sctx.font = "bold 92px monospace";
-        sctx.textAlign = "center";
-        sctx.textBaseline = "middle";
-        sctx.fillText("80", 128, 118);
-        sctx.font = "bold 26px sans-serif";
-        sctx.fillStyle = "#991b1b";
-        sctx.fillText("LIMIT km/h", 128, 184);
+          const signCanvas = document.createElement("canvas");
+          signCanvas.width = 256;
+          signCanvas.height = 256;
+          const sctx = signCanvas.getContext("2d");
+          sctx.fillStyle = "#ffffff";
+          sctx.fillRect(0, 0, 256, 256);
+          sctx.strokeStyle = "#dc2626";
+          sctx.lineWidth = 28;
+          sctx.beginPath();
+          sctx.arc(128, 128, 106, 0, Math.PI * 2);
+          sctx.stroke();
+          sctx.fillStyle = "#0f172a";
+          sctx.font = "bold 92px monospace";
+          sctx.textAlign = "center";
+          sctx.textBaseline = "middle";
+          sctx.fillText("80", 128, 118);
+          sctx.font = "bold 26px sans-serif";
+          sctx.fillStyle = "#991b1b";
+          sctx.fillText("LIMIT km/h", 128, 184);
 
-        const signBoardTex = new THREE.CanvasTexture(signCanvas);
-        signBoardTex.colorSpace = THREE.SRGBColorSpace;
-        const signBoard = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.75, 0.75, 0.1, 24),
-          [
-            steelMat,
-            new THREE.MeshStandardMaterial({ map: signBoardTex, roughness: 0.4 }),
-            new THREE.MeshStandardMaterial({ map: signBoardTex, roughness: 0.4 }),
-          ]
-        );
-        signBoard.rotation.z = Math.PI / 2;
-        signBoard.position.y = 2.85;
-        signBoard.castShadow = !isSoftwareGl;
-        speedSignGroup.add(signPole, signBoard);
-        threeScene.add(speedSignGroup);
+          const signBoardTex = new THREE.CanvasTexture(signCanvas);
+          signBoardTex.colorSpace = THREE.SRGBColorSpace;
+          const signBoard = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.75, 0.75, 0.1, 24),
+            [
+              steelMat,
+              new THREE.MeshStandardMaterial({ map: signBoardTex, roughness: 0.4 }),
+              new THREE.MeshStandardMaterial({ map: signBoardTex, roughness: 0.4 }),
+            ]
+          );
+          signBoard.rotation.z = Math.PI / 2;
+          signBoard.position.y = 2.85;
+          signBoard.castShadow = !isSoftwareGl;
+          speedSignGroup.add(signPole, signBoard);
+          threeScene.add(speedSignGroup);
+        }
 
         // ============================================================
         // PROCEDURAL MULTI-PART VEHICLES (THREE.Group, bottom-center grounded)
@@ -3244,7 +3281,6 @@
         }
 
         // Spawn 5 Normal Traffic Cars on Main Lane (z = +2.3)
-        const KMH_TO_UNITS = 0.16;
         const normalTrafficSpecs = [
           { id: "car-0", name: "Neeli Car", dot: "#2563eb", color: 0x2563eb, hatch: false, initX: -2.2, initKmh: 55 },
           { id: "car-1", name: "Laal Car", dot: "#dc2626", color: 0xdc2626, hatch: true, initX: -9.5, initKmh: 62 },
@@ -3263,7 +3299,7 @@
           car.speed = 0;
           car.group.userData.vehicleId = spec.id;
           car.group.position.set(car.x, 0, 2.3);
-          threeScene.add(car.group);
+          if (threeScene) threeScene.add(car.group);
           return car;
         });
 
@@ -3279,7 +3315,7 @@
         ambulanceActor.group.userData.vehicleId = "ambulance";
         ambulanceActor.group.position.set(ambulanceX, 0, -2.3);
         ambulanceActor.group.visible = false;
-        threeScene.add(ambulanceActor.group);
+        if (threeScene) threeScene.add(ambulanceActor.group);
 
         // Spawn 3-Vehicle CM Convoy on Priority Lane (z = -2.3)
         const pilotCar = createPilotCar();
@@ -3311,7 +3347,7 @@
         let convoyLiveKmh = 0;
         convoyGroup.position.set(convoyX, 0, -2.3);
         convoyGroup.visible = false;
-        threeScene.add(convoyGroup);
+        if (threeScene) threeScene.add(convoyGroup);
 
         // Vehicle Registry + Floating Speed Badges + Raycaster Selection
         let selectedVehicleId = null;
@@ -3476,35 +3512,103 @@
           updateLiveSpeedHud(true);
         }
 
-        // Raycast click-vs-drag on 3D canvas
+        // Raycast click-vs-drag on 3D canvas (or 2D fallback canvas)
         let pointerDownX = 0;
         let pointerDownY = 0;
-        threeRenderer.domElement.addEventListener("pointerdown", (e) => {
-          pointerDownX = e.clientX;
-          pointerDownY = e.clientY;
-        });
-        threeRenderer.domElement.addEventListener("pointerup", (e) => {
-          if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 6) return;
-          const rect = threeRenderer.domElement.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) return;
-          _pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-          _pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-          raycaster.setFromCamera(_pointerNdc, threeCamera);
-          const hits = raycaster.intersectObjects(selectableGroups, true);
-          for (let h = 0; h < hits.length; h++) {
-            let obj = hits[h].object;
-            while (obj && !obj.userData.vehicleId) {
-              obj = obj.parent;
+        if (threeRenderer) {
+          threeRenderer.domElement.addEventListener("pointerdown", (e) => {
+            pointerDownX = e.clientX;
+            pointerDownY = e.clientY;
+          });
+          threeRenderer.domElement.addEventListener("pointerup", (e) => {
+            if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 6) return;
+            const rect = threeRenderer.domElement.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0 || !threeCamera) return;
+            _pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            _pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(_pointerNdc, threeCamera);
+            const hits = raycaster.intersectObjects(selectableGroups, true);
+            for (let h = 0; h < hits.length; h++) {
+              let obj = hits[h].object;
+              while (obj && !obj.userData.vehicleId) {
+                obj = obj.parent;
+              }
+              if (obj && obj.userData.vehicleId) {
+                const entry = vehicleMap.get(obj.userData.vehicleId);
+                if (entry && entry.isVisible()) {
+                  selectVehicle(entry.id);
+                  return;
+                }
+              }
             }
-            if (obj && obj.userData.vehicleId) {
-              const entry = vehicleMap.get(obj.userData.vehicleId);
-              if (entry && entry.isVisible()) {
+          });
+        } else {
+          fallbackCanvas = document.createElement("canvas");
+          fallbackCanvas.width = 640;
+          fallbackCanvas.height = 360;
+          fallbackCanvas.style.width = "100%";
+          fallbackCanvas.style.height = "100%";
+          fallbackCanvas.style.display = "block";
+          threeMount.appendChild(fallbackCanvas);
+          fallbackCtx = fallbackCanvas.getContext("2d");
+          fallbackCanvas.addEventListener("click", (e) => {
+            const rect = fallbackCanvas.getBoundingClientRect();
+            const mx = ((e.clientX - rect.left) / rect.width) * stageWFallback();
+            const my = ((e.clientY - rect.top) / rect.height) * stageHFallback();
+            for (const entry of vehicleEntries) {
+              if (!entry.isVisible()) continue;
+              const p = worldTo2DScreen(entry);
+              if (Math.abs(mx - p.x) < 34 && Math.abs(my - p.y) < 18) {
                 selectVehicle(entry.id);
                 return;
               }
             }
-          }
-        });
+          });
+        }
+
+        function stageWFallback() {
+          return threeMount.clientWidth || 640;
+        }
+        function stageHFallback() {
+          return threeMount.clientHeight || 360;
+        }
+        function worldTo2DScreen(entry) {
+          entry.getWorldPos(_projVec);
+          const w = stageWFallback();
+          const h = stageHFallback();
+          const sx = ((_projVec.x + 36) / 76) * w;
+          const sy = _projVec.z < 0 ? h * 0.44 : h * 0.64;
+          return { x: sx, y: sy };
+        }
+
+        function draw2DFallbackRoad() {
+          if (!fallbackCtx || !fallbackCanvas) return;
+          const w = fallbackCanvas.width;
+          const h = fallbackCanvas.height;
+          const isNight = trafficState.nightMode;
+          fallbackCtx.fillStyle = isNight ? "#0b1224" : "#dbeafe";
+          fallbackCtx.fillRect(0, 0, w, h * 0.36);
+          fallbackCtx.fillStyle = isNight ? "#1e293b" : "#4d7c0f";
+          fallbackCtx.fillRect(0, h * 0.36, w, h * 0.64);
+          fallbackCtx.fillStyle = "#334155";
+          fallbackCtx.fillRect(0, h * 0.4, w, h * 0.38);
+          fallbackCtx.strokeStyle = "#f8fafc";
+          fallbackCtx.setLineDash([18, 14]);
+          fallbackCtx.beginPath();
+          fallbackCtx.moveTo(0, h * 0.59);
+          fallbackCtx.lineTo(w, h * 0.59);
+          fallbackCtx.stroke();
+          fallbackCtx.setLineDash([]);
+          const stopPx = ((STOP_LINE_X + 36) / 76) * w;
+          fallbackCtx.fillStyle = "#f8fafc";
+          fallbackCtx.fillRect(stopPx, h * 0.41, 4, h * 0.36);
+          vehicleEntries.forEach((entry) => {
+            if (!entry.isVisible()) return;
+            const p = worldTo2DScreen(entry);
+            fallbackCtx.fillStyle = entry.dot;
+            fallbackCtx.fillRect(p.x - 22, p.y - 10, 44, 20);
+          });
+        }
 
         function updateLiveSpeedHud(forceDomSync) {
           const limit = trafficConfig.speedLimit;
@@ -3519,14 +3623,21 @@
               badge.style.display = "none";
               return;
             }
-            entry.getWorldPos(_projVec);
-            _projVec.project(threeCamera);
-            if (_projVec.z > 1 || _projVec.z < -1) {
-              badge.style.display = "none";
-              return;
+            let sx, sy;
+            if (threeCamera) {
+              entry.getWorldPos(_projVec);
+              _projVec.project(threeCamera);
+              if (_projVec.z > 1 || _projVec.z < -1) {
+                badge.style.display = "none";
+                return;
+              }
+              sx = (_projVec.x * 0.5 + 0.5) * stageW;
+              sy = (-_projVec.y * 0.5 + 0.5) * stageH;
+            } else {
+              const p = worldTo2DScreen(entry);
+              sx = p.x;
+              sy = p.y - 14;
             }
-            const sx = (_projVec.x * 0.5 + 0.5) * stageW;
-            const sy = (-_projVec.y * 0.5 + 0.5) * stageH;
             if (sx < -30 || sx > stageW + 30 || sy < 8 || sy > stageH + 20) {
               badge.style.display = "none";
               return;
@@ -3627,23 +3738,31 @@
           const w = threeMount.clientWidth || 640;
           const h = threeMount.clientHeight || 360;
           if (w <= 0 || h <= 0) return;
-          threeCamera.aspect = w / h;
-          threeCamera.updateProjectionMatrix();
-          threeRenderer.setSize(w, h);
+          if (threeCamera && threeRenderer) {
+            threeCamera.aspect = w / h;
+            threeCamera.updateProjectionMatrix();
+            threeRenderer.setSize(w, h);
+          } else if (fallbackCanvas) {
+            fallbackCanvas.width = w;
+            fallbackCanvas.height = h;
+          }
         }
 
         const resizeObs = new ResizeObserver(() => resizeThreeScene());
         resizeObs.observe(threeMount);
         resizeThreeScene();
+        window.addEventListener("load", () => resizeThreeScene());
+        requestAnimationFrame(() => resizeThreeScene());
 
         // ============================================================
-        // 3D ANIMATION LOOP (clock.getDelta() + Software WebGL afterDraw)
+        // 3D ANIMATION LOOP (performance.now() + Software WebGL afterDraw)
         // ============================================================
-        const clock = new THREE.Clock();
+        const animStartMs = performance.now();
+        let prevFrameMs = animStartMs;
         let threeFrameId = 0;
 
         function afterDraw(cb) {
-          const gl = threeRenderer.getContext();
+          const gl = threeRenderer ? threeRenderer.getContext() : null;
           if (!gl || !gl.fenceSync) {
             threeFrameId = window.setTimeout(cb, 80);
             return;
@@ -3665,14 +3784,19 @@
         function update3DScene(delta, elapsed) {
           const isNight = trafficState.nightMode;
 
-          // Day / Night atmosphere damping
-          const targetSky = isNight ? _skyNight : _skyDay;
-          threeScene.background.lerp(targetSky, 1 - Math.exp(-5 * delta));
-          threeScene.fog.color.copy(threeScene.background);
-          hemiLight.color.lerp(isNight ? _hemiNightSky : _hemiDaySky, 1 - Math.exp(-5 * delta));
-          hemiLight.groundColor.lerp(isNight ? _hemiNightGround : _hemiDayGround, 1 - Math.exp(-5 * delta));
-          sunLight.intensity = THREE.MathUtils.damp(sunLight.intensity, isNight ? 0.32 : 1.55, 5, delta);
-          hemiLight.intensity = THREE.MathUtils.damp(hemiLight.intensity, isNight ? 0.38 : 0.72, 5, delta);
+          if (threeScene) {
+            const targetSky = isNight ? _skyNight : _skyDay;
+            threeScene.background.lerp(targetSky, 1 - Math.exp(-5 * delta));
+            threeScene.fog.color.copy(threeScene.background);
+            if (hemiLight) {
+              hemiLight.color.lerp(isNight ? _hemiNightSky : _hemiDaySky, 1 - Math.exp(-5 * delta));
+              hemiLight.groundColor.lerp(isNight ? _hemiNightGround : _hemiDayGround, 1 - Math.exp(-5 * delta));
+              hemiLight.intensity = THREE.MathUtils.damp(hemiLight.intensity, isNight ? 0.38 : 0.72, 5, delta);
+            }
+            if (sunLight) {
+              sunLight.intensity = THREE.MathUtils.damp(sunLight.intensity, isNight ? 0.32 : 1.55, 5, delta);
+            }
+          }
 
           streetLampGlowMats.forEach((m) => {
             m.emissiveIntensity = THREE.MathUtils.damp(m.emissiveIntensity, isNight ? 2.2 : 0.0, 6, delta);
@@ -3823,43 +3947,51 @@
           }
 
           // Camera Preset Smooth Damping (or dynamic VIP/Ambulance tracking)
-          if (isCameraDamping) {
-            const preset = CAMERA_PRESETS[activeCamPresetIdx];
-            _camTargetPos.copy(preset.pos);
-            _camLookTarget.copy(preset.target);
-            if (activeCamPresetIdx === 3) {
-              const trackX = trafficState.cmConvoy
-                ? convoyX
-                : trafficState.ambulanceMode
-                ? ambulanceX
-                : normalTrafficCars[0].x;
-              const clampedX = THREE.MathUtils.clamp(trackX, -18, 18);
-              _camTargetPos.set(clampedX - 8.5, 4.0, -9.8);
-              _camLookTarget.set(clampedX + 1.5, 1.0, trafficState.cmConvoy || trafficState.ambulanceMode ? -2.3 : 1.0);
-            }
-            threeCamera.position.x = THREE.MathUtils.damp(threeCamera.position.x, _camTargetPos.x, 4.5, delta);
-            threeCamera.position.y = THREE.MathUtils.damp(threeCamera.position.y, _camTargetPos.y, 4.5, delta);
-            threeCamera.position.z = THREE.MathUtils.damp(threeCamera.position.z, _camTargetPos.z, 4.5, delta);
-            orbitControls.target.x = THREE.MathUtils.damp(orbitControls.target.x, _camLookTarget.x, 4.5, delta);
-            orbitControls.target.y = THREE.MathUtils.damp(orbitControls.target.y, _camLookTarget.y, 4.5, delta);
-            orbitControls.target.z = THREE.MathUtils.damp(orbitControls.target.z, _camLookTarget.z, 4.5, delta);
+          if (threeCamera && orbitControls) {
+            if (isCameraDamping) {
+              const preset = CAMERA_PRESETS[activeCamPresetIdx];
+              _camTargetPos.copy(preset.pos);
+              _camLookTarget.copy(preset.target);
+              if (activeCamPresetIdx === 3) {
+                const trackX = trafficState.cmConvoy
+                  ? convoyX
+                  : trafficState.ambulanceMode
+                  ? ambulanceX
+                  : normalTrafficCars[0].x;
+                const clampedX = THREE.MathUtils.clamp(trackX, -18, 18);
+                _camTargetPos.set(clampedX - 8.5, 4.0, -9.8);
+                _camLookTarget.set(clampedX + 1.5, 1.0, trafficState.cmConvoy || trafficState.ambulanceMode ? -2.3 : 1.0);
+              }
+              threeCamera.position.x = THREE.MathUtils.damp(threeCamera.position.x, _camTargetPos.x, 4.5, delta);
+              threeCamera.position.y = THREE.MathUtils.damp(threeCamera.position.y, _camTargetPos.y, 4.5, delta);
+              threeCamera.position.z = THREE.MathUtils.damp(threeCamera.position.z, _camTargetPos.z, 4.5, delta);
+              orbitControls.target.x = THREE.MathUtils.damp(orbitControls.target.x, _camLookTarget.x, 4.5, delta);
+              orbitControls.target.y = THREE.MathUtils.damp(orbitControls.target.y, _camLookTarget.y, 4.5, delta);
+              orbitControls.target.z = THREE.MathUtils.damp(orbitControls.target.z, _camLookTarget.z, 4.5, delta);
 
-            if (activeCamPresetIdx !== 3 && threeCamera.position.distanceTo(_camTargetPos) < 0.05) {
-              isCameraDamping = false;
+              if (activeCamPresetIdx !== 3 && threeCamera.position.distanceTo(_camTargetPos) < 0.05) {
+                isCameraDamping = false;
+              }
             }
+            orbitControls.update();
           }
-          orbitControls.update();
         }
 
         function tick3D() {
-          const delta = Math.min(clock.getDelta(), 0.1);
-          const elapsed = clock.getElapsedTime();
+          const nowMs = performance.now();
+          const delta = Math.min((nowMs - prevFrameMs) / 1000, 0.1);
+          prevFrameMs = nowMs;
+          const elapsed = (nowMs - animStartMs) / 1000;
           if (activeTab === "traffic") {
             update3DScene(delta, elapsed);
-            threeRenderer.render(threeScene, threeCamera);
+            if (threeRenderer && threeScene && threeCamera) {
+              threeRenderer.render(threeScene, threeCamera);
+            } else if (is2DFallback) {
+              draw2DFallbackRoad();
+            }
             updateLiveSpeedHud(false);
           }
-          if (isSoftwareGl) {
+          if (isSoftwareGl || is2DFallback) {
             afterDraw(tick3D);
           } else {
             threeFrameId = requestAnimationFrame(tick3D);
